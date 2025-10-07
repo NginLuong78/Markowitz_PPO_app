@@ -1,515 +1,270 @@
-# helpers_vn30.py
-# Utility functions and helper modules for VN30 Portfolio Optimization
-# ===============================================
+"""
+helpers_vn30.py
+---------------------------------------
+Module hỗ trợ xử lý dữ liệu, tính toán chỉ báo kỹ thuật,
+tối ưu hóa danh mục Markowitz, và xây dựng môi trường giao dịch VN30.
+---------------------------------------
+Tác giả: Thành Công Nguyễn (2025)
+"""
 
-import os, math, json, time, warnings, logging
+import os
+import io
+import math
+import time
+import json
+import logging
+import warnings
+from typing import List, Tuple, Dict, Optional, Any
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from scipy.optimize import minimize
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import streamlit as st
 
-# ---------------------------
-# 1️⃣ Technical Indicators
-# ---------------------------
-def compute_rsi(series, period=14):
+warnings.filterwarnings("ignore")
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
+
+# ======================
+# 1️⃣ Kỹ thuật chỉ báo
+# ======================
+
+def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Tính chỉ báo RSI (Relative Strength Index)."""
     delta = series.diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-def compute_bollinger_bands(series, window=20, num_std=2):
-    ma = series.rolling(window=window).mean()
-    std = series.rolling(window=window).std()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.rolling(window=period, min_periods=1).mean()
+    avg_loss = loss.rolling(window=period, min_periods=1).mean()
+    rs = avg_gain / (avg_loss + 1e-10)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50.0)
+
+def compute_bollinger_bands(series: pd.Series, window: int = 20, num_std: float = 2.0):
+    """Tính Bollinger Bands."""
+    ma = series.rolling(window=window, min_periods=1).mean()
+    std = series.rolling(window=window, min_periods=1).std()
     upper = ma + num_std * std
     lower = ma - num_std * std
-    return upper, lower
-def compute_atr(high, low, close, period=14):
-    tr = pd.concat([
-        high - low,
-        abs(high - close.shift(1)),
-        abs(low - close.shift(1))
-    ], axis=1).max(axis=1)
-    return tr.rolling(window=period).mean()
-def compute_obv(close, volume):
-    obv = [0]
-    for i in range(1, len(close)):
-        if close.iloc[i] > close.iloc[i - 1]:
-            obv.append(obv[-1] + volume.iloc[i])
-        elif close.iloc[i] < close.iloc[i - 1]:
-            obv.append(obv[-1] - volume.iloc[i])
-        else:
-            obv.append(obv[-1])
-    return pd.Series(obv, index=close.index)
-def compute_volume_oscillator(volume, short=5, long=20):
-    short_ma = volume.rolling(window=short).mean()
-    long_ma = volume.rolling(window=long).mean()
-    return ((short_ma - long_ma) / long_ma) * 100
-def compute_macd(series, short=12, long=26, signal=9):
-    ema_short = series.ewm(span=short, adjust=False).mean()
-    ema_long = series.ewm(span=long, adjust=False).mean()
+    return ma, upper, lower
+
+def compute_ema(series: pd.Series, span: int = 20) -> pd.Series:
+    """Exponential Moving Average (EMA)."""
+    return series.ewm(span=span, adjust=False).mean().fillna(method="bfill")
+
+def compute_macd(series: pd.Series, short: int = 12, long: int = 26, signal: int = 9):
+    """Tính MACD."""
+    ema_short = compute_ema(series, short)
+    ema_long = compute_ema(series, long)
     macd = ema_short - ema_long
     signal_line = macd.ewm(span=signal, adjust=False).mean()
-    hist = macd - signal_line
-    return macd, signal_line, hist
-def add_indicators_per_stock(df):
-    df = df.copy().sort_values(['id', 'date'])
-    result = []
-    for stock_id in df['id'].unique():
-        stock = df[df['id'] == stock_id].copy()
-        stock['sma_5'] = stock['close'].rolling(5).mean()
-        stock['sma_20'] = stock['close'].rolling(20).mean()
-        stock['ema_10'] = stock['close'].ewm(span=10, adjust=False).mean()
-        stock['rsi_14'] = compute_rsi(stock['close'], 14)
-        stock['momentum'] = stock['close'] - stock['close'].shift(5)
-        stock['bb_upper'], stock['bb_lower'] = compute_bollinger_bands(stock['close'])
-        stock['atr_14'] = compute_atr(stock['high'], stock['low'], stock['close'], 14)
-        stock['obv'] = compute_obv(stock['close'], stock['volume'])
-        stock['vol_osc'] = compute_volume_oscillator(stock['volume'])
-        stock['macd'], stock['macd_signal'], stock['macd_hist'] = compute_macd(stock['close'])
-        result.append(stock)
-    return pd.concat(result).reset_index(drop=True)
-def compute_vn30_index_with_indicators(df):
-    df = df.copy()
-    df = add_indicators_per_stock(df)
-    daily_df = df.groupby('date').agg({
-        'high': 'mean',
-        'low': 'mean',
-        'close': 'mean',
-        'volume': 'sum'
-    }).reset_index()
-    daily_df.rename(columns={'close': 'vn30_index'}, inplace=True)
-    daily_df['sma_5'] = daily_df['vn30_index'].rolling(5).mean()
-    daily_df['sma_20'] = daily_df['vn30_index'].rolling(20).mean()
-    daily_df['ema_10'] = daily_df['vn30_index'].ewm(span=10, adjust=False).mean()
-    daily_df['rsi_14'] = compute_rsi(daily_df['vn30_index'], 14)
-    daily_df['momentum'] = daily_df['vn30_index'] - daily_df['vn30_index'].shift(5)
-    daily_df['bb_upper'], daily_df['bb_lower'] = compute_bollinger_bands(daily_df['vn30_index'])
-    daily_df['atr_14'] = compute_atr(daily_df['high'], daily_df['low'], daily_df['vn30_index'], 14)
-    daily_df['obv'] = compute_obv(daily_df['vn30_index'], daily_df['volume'])
-    daily_df['vol_osc'] = compute_volume_oscillator(daily_df['volume'])
-    daily_df['macd'], daily_df['macd_signal'], daily_df['macd_hist'] = compute_macd(daily_df['vn30_index'])
-    return df.dropna().reset_index(drop=True), daily_df.dropna().reset_index(drop=True)
-# ---------------------------
-# 2️⃣ Financial Metrics & Markowitz Optimization
-# ---------------------------
-def calculate_annualized_returns(df: pd.DataFrame, annualize: bool = True) -> pd.Series:
-    """
-    Tính tỷ suất sinh lời log và annualized return cho từng mã cổ phiếu.
-    """
-    required_cols = ['id', 'date', 'close']
-    if not all(col in df.columns for col in required_cols):
-        raise KeyError(f"Thiếu cột bắt buộc trong DataFrame: {required_cols}")
-    df = df.sort_values(['id', 'date']).copy()
-    df['log_return'] = df.groupby('id')['close'].apply(lambda x: np.log(x / x.shift(1))).reset_index(level=0, drop=True)
-    mean_returns = df.groupby('id')['log_return'].mean()
-    return mean_returns * 252 if annualize else mean_returns
-def calculate_cov_matrix(df: pd.DataFrame, annualize: bool = True) -> pd.DataFrame:
-    """
-    Tính ma trận hiệp phương sai dựa trên log return.
-    """
-    pivot = df.pivot(index='date', columns='id', values='log_return')
-    cov_matrix = pivot.cov()
-    return cov_matrix * 252 if annualize else cov_matrix
-def optimize_markowitz(mean_returns: pd.Series,
-                       cov_matrix: pd.DataFrame,
-                       top_n: int = 10,
-                       method: str = 'min_variance',
-                       lambda_l2: float = 0.0,
-                       max_weight: float = 1.0) -> tuple:
-    """
-    Hàm tối ưu hóa danh mục theo Mean-Variance hoặc Sharpe.
-    """
-    tickers = mean_returns.index.tolist()
-    num_assets = len(tickers)
-    def objective(weights):
-        variance = weights.T @ cov_matrix.values @ weights
-        if method == 'sharpe':
-            expected_return = weights.T @ mean_returns.values
-            sharpe = expected_return / (np.sqrt(variance) + 1e-6)
-            return -sharpe
-        else:
-            return variance + lambda_l2 * np.sum(weights**2)
-    constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}]
-    bounds = [(0, max_weight)] * num_assets
-    init_guess = np.array([1.0 / num_assets] * num_assets)
-    result = minimize(objective, init_guess, method='SLSQP',
-                      bounds=bounds, constraints=constraints)
-    if not result.success:
-        raise ValueError("Tối ưu hóa Markowitz thất bại.")
-    weights = result.x
-    top_indices = np.argsort(weights)[::-1][:top_n]
-    selected_ids = [tickers[i] for i in top_indices]
-    selected_weights = [weights[i] for i in top_indices]
-    return selected_ids, selected_weights
-def markowitz_pipeline_with_auto_retry(df: pd.DataFrame,
-                                       top_n: int = 10,
-                                       lambda_l2: float = 0.0,
-                                       method: str = 'sharpe',
-                                       max_weight_list: list = [0.1, 0.2, 0.25, 0.3, 0.5, 0.7, 1.0],
-                                       annualize: bool = True) -> tuple:
-    """
-    Tự động thử nhiều max_weight để tránh lỗi tối ưu hóa thất bại.
-    """
-    # Chuẩn hóa tên cột
-    df.columns = df.columns.str.lower()
-    # Kiểm tra tồn tại cột
-    if not {'id', 'date', 'close'}.issubset(df.columns):
-        raise KeyError("DataFrame phải chứa các cột: 'id', 'date', 'close'.")
-    print("Tính toán mean return và covariance matrix...")
-    df = df.sort_values(['id', 'date']).copy()
-    # Drop duplicate entries based on 'date' and 'id'
-    df = df.drop_duplicates(subset=['date', 'id']).copy()
-    df['log_return'] = df.groupby('id')['close'].apply(lambda x: np.log(x / x.shift(1))).reset_index(level=0, drop=True)
-    mean_returns = calculate_annualized_returns(df, annualize)
-    cov_matrix = calculate_cov_matrix(df, annualize)
-    for max_weight in max_weight_list:
-        print(f"Thử tối ưu với max_weight = {int(max_weight * 100)}%...")
-        try:
-            selected_ids, selected_weights = optimize_markowitz(
-                mean_returns=mean_returns,
-                cov_matrix=cov_matrix,
-                top_n=top_n,
-                method=method,
-                lambda_l2=lambda_l2,
-                max_weight=max_weight
-            )
-            print("Tối ưu thành công với max_weight =", max_weight)
-            for t, w in zip(selected_ids, selected_weights):
-                print(f" - {t}: {w:.2%}")
-            return selected_ids, selected_weights
-        except ValueError as e:
-            print(f"Tối ưu thất bại với max_weight = {int(max_weight * 100)}%: {e}")
+    return macd, signal_line
 
-    raise ValueError("Tối ưu thất bại với mọi giá trị max_weight thử nghiệm.")
-# ---------------------------
-# 3️⃣ Plotting Helpers for Streamlit Dashboard
-# ---------------------------
-def plot_vn30_index_indicators(df):
-    df = df.copy()
-    df['date'] = pd.to_datetime(df['date'])
-    # --- 1. VN30 Index + SMA + EMA ---
-    fig, ax = plt.subplots(figsize=(14, 6))
-    ax.plot(df['date'], df['vn30_index'], label='VN30 Index', color='black', linewidth=2)
-    ax.plot(df['date'], df['sma_5'], label='SMA 5', linestyle='--', color='steelblue')
-    ax.plot(df['date'], df['sma_20'], label='SMA 20', linestyle='--', color='seagreen')
-    ax.plot(df['date'], df['ema_10'], label='EMA 10', linestyle='-', color='orange', linewidth=1.5)
-    ax.set_title('VN30 Index with SMA & EMA')
-    ax.legend()
-    ax.grid(True)
-    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
-    plt.xticks(rotation=45)
+def compute_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14):
+    """Tính ATR (Average True Range)."""
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(window=period, min_periods=1).mean()
+    return atr.fillna(method="bfill")
+
+def compute_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """Tính On-Balance Volume (OBV)."""
+    obv = [0.0]
+    for i in range(1, len(close)):
+        if close[i] > close[i - 1]:
+            obv.append(obv[-1] + volume[i])
+        elif close[i] < close[i - 1]:
+            obv.append(obv[-1] - volume[i])
+        else:
+            obv.append(obv[-1])
+    return pd.Series(obv, index=close.index).fillna(method="ffill").fillna(0.0)
+
+def compute_volume_oscillator(volume: pd.Series, short: int = 5, long: int = 20):
+    """Tính Volume Oscillator (%)."""
+    short_ma = volume.rolling(window=short, min_periods=1).mean()
+    long_ma = volume.rolling(window=long, min_periods=1).mean().replace(0, 1e-10)
+    return ((short_ma - long_ma) / (long_ma + 1e-10) * 100).fillna(0.0)
+
+
+# ===============================
+# 2️⃣ VN30 Index + Daily Data
+# ===============================
+
+def compute_vn30_index_with_indicators(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Tính toán chỉ báo kỹ thuật cho VN30 Index."""
+    df = df.sort_values("date").reset_index(drop=True)
+    df["SMA_20"] = df["close"].rolling(window=20, min_periods=1).mean()
+    df["EMA_20"] = compute_ema(df["close"], 20)
+    df["RSI_14"] = compute_rsi(df["close"], 14)
+    df["MACD"], df["MACD_signal"] = compute_macd(df["close"])
+    df["ATR_14"] = compute_atr(df["high"], df["low"], df["close"])
+    df["OBV"] = compute_obv(df["close"], df["volume"])
+    df["Vol_Osc"] = compute_volume_oscillator(df["volume"])
+
+    daily_df = df[["date", "close", "RSI_14", "ATR_14", "MACD", "MACD_signal", "Vol_Osc"]].copy()
+    df = df.fillna(method='ffill').fillna(method='bfill')
+    daily_df = daily_df.fillna(method='ffill').fillna(method='bfill')
+    return df, daily_df
+
+
+def plot_vn30_index_indicators(df: pd.DataFrame):
+    """Biểu đồ VN30 với RSI và Bollinger Bands."""
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+    ax1.plot(df["date"], df["close"], label="VN30 Close", color="blue")
+    ma, upper, lower = compute_bollinger_bands(df["close"])
+    ax1.plot(df["date"], ma, color="orange", label="SMA20")
+    ax1.fill_between(df["date"], lower, upper, color="gray", alpha=0.2, label="Bollinger Band")
+    ax1.set_xlabel("Date")
+    ax1.set_ylabel("Price")
+    ax1.legend(loc="upper left")
+    ax1.grid(True)
     plt.tight_layout()
-    plt.show()
-    # --- 2. RSI & Momentum ---
-    fig, ax1 = plt.subplots(figsize=(14, 6))
-    ax1.plot(df['date'], df['rsi_14'], label='RSI 14', color='darkorange')
-    ax1.axhline(70, color='red', linestyle='--', alpha=0.6)
-    ax1.axhline(30, color='green', linestyle='--', alpha=0.6)
-    ax1.set_ylabel('RSI')
-    ax2 = ax1.twinx()
-    ax2.plot(df['date'], df['momentum'], label='Momentum', color='blue')
-    ax2.set_ylabel('Momentum')
-    plt.title('VN30 RSI & Momentum')
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.show()
-    # --- 3. Bollinger Bands ---
-    fig, ax = plt.subplots(figsize=(14, 6))
-    ax.plot(df['date'], df['vn30_index'], label='VN30 Index', color='black')
-    ax.plot(df['date'], df['bb_upper'], label='Upper Band', linestyle='--', color='red')
-    ax.plot(df['date'], df['bb_lower'], label='Lower Band', linestyle='--', color='blue')
-    ax.plot(df['date'], df['sma_20'], label='SMA 20', linestyle=':', color='gray')
-    ax.fill_between(df['date'], df['bb_lower'], df['bb_upper'], color='lightblue', alpha=0.2)
-    ax.set_title('VN30 Bollinger Bands')
-    ax.legend()
-    ax.grid(True)
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.show()
-    # --- 4. OBV, ATR, Volume Oscillator ---
-    fig, axs = plt.subplots(3, 1, figsize=(14, 9), sharex=True)
-    axs[0].plot(df['date'], df['obv'], color='purple', label='OBV')
-    axs[1].plot(df['date'], df['atr_14'], color='brown', label='ATR 14')
-    axs[2].plot(df['date'], df['vol_osc'], color='teal', label='Volume Oscillator')
-    for ax in axs:
-        ax.legend()
-        ax.grid(True)
-    fig.suptitle('VN30 OBV, ATR, Volume Oscillator')
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.show()
-    # --- 5. MACD ---
-    fig, ax = plt.subplots(figsize=(14, 6))
-    ax.plot(df['date'], df['macd'], label='MACD', color='blue')
-    ax.plot(df['date'], df['macd_signal'], label='Signal', color='red')
-    ax.bar(df['date'], df['macd_hist'], label='Histogram', color='gray', alpha=0.3)
-    ax.set_title('VN30 MACD')
-    ax.legend()
-    ax.grid(True)
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.show()
-def plot_risk_contributions(selected_ids, selected_weights, cov_matrix, mean_returns):
-    tickers = mean_returns.index.tolist()
-    weights_vec = np.array([selected_weights[selected_ids.index(t)] if t in selected_ids else 0.0 for t in tickers])
-    port_volatility = np.sqrt(weights_vec @ cov_matrix.values @ weights_vec)
-    total_risk = cov_matrix.values @ weights_vec
-    risk_contrib = weights_vec * total_risk
-    risk_contrib_pct = risk_contrib / (port_volatility**2 + 1e-8)
-    top_risks = [risk_contrib_pct[tickers.index(t)] for t in selected_ids]
-    plt.figure(figsize=(10, 5))
-    plt.bar(selected_ids, np.array(top_risks) * 100, color='orange')
-    plt.title("Tỷ lệ đóng góp rủi ro vào danh mục (Top 10 cổ phiếu)")
-    plt.ylabel("Đóng góp rủi ro (%)")
-    plt.grid(True, axis='y')
-    plt.tight_layout()
-    plt.show()
-# Biểu đồ 2: Đường cong Markowitz (Efficient Frontier)
-def plot_efficient_frontier(mean_returns, cov_matrix, selected_ids, selected_weights):
-    num_portfolios = 100_000
-    results = np.zeros((3, num_portfolios))
-    tickers = mean_returns.index.tolist()
-    for i in range(num_portfolios):
-        weights = np.random.random(len(tickers))
-        weights /= np.sum(weights)
-        ret = np.dot(weights, mean_returns)
-        vol = np.sqrt(weights @ cov_matrix.values @ weights)
-        sharpe = ret / (vol + 1e-6)
-        results[0, i] = vol
-        results[1, i] = ret
-        results[2, i] = sharpe
-    max_sharpe_idx = np.argmax(results[2])
-    min_vol_idx = np.argmin(results[0])
-    plt.figure(figsize=(10, 7))
-    plt.scatter(results[0, :], results[1, :], c=results[2, :], cmap='viridis', alpha=0.5)
-    plt.colorbar(label='Sharpe Ratio')
-    plt.xlabel('Annualised Volatility')
-    plt.ylabel('Annualised Return')
-    plt.title('Đường cong Markowitz - Portfolio Optimization')
-    # Vẽ điểm danh mục đã tối ưu
-    w_opt = np.array([selected_weights[selected_ids.index(t)] if t in selected_ids else 0.0 for t in tickers])
-    ret_opt = np.dot(w_opt, mean_returns)
-    vol_opt = np.sqrt(w_opt @ cov_matrix.values @ w_opt)
-    plt.scatter(vol_opt, ret_opt, marker='^', color='red', s=200, label='Danh mục tối ưu')
-    # Vẽ điểm danh mục min volatility và max Sharpe từ random portfolio
-    plt.scatter(results[0, min_vol_idx], results[1, min_vol_idx], marker='v', color='green', s=200, label='Minimum volatility')
-    plt.scatter(results[0, max_sharpe_idx], results[1, max_sharpe_idx], marker='*', color='purple', s=200, label='Max Sharpe ratio')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
-# ---------------------------
-# 4️⃣ Trading Strategies (Momentum, Mean Reversion, etc.)
-# ---------------------------
-class TradingStrategy:
-    def generate_signal(self, df, step, tickers):
-        raise NotImplementedError("Bạn cần override hàm này trong subclass.")
-# Momentum Strategy (Chiến lược nền duy nhất)
-class MomentumStrategy(TradingStrategy):
-    def __init__(self, short_window=5, long_window=20):
-        self.short = short_window
-        self.long = long_window
-    def generate_signal(self, df, step, tickers):
-        signals = []
-        for ticker in tickers:
-            df_t = df[df['id'] == ticker].iloc[:step+1].copy()
-            if len(df_t) < self.long:
-                signals.append(0)
-                continue
-            sma_short = df_t['close'].rolling(self.short).mean().iloc[-1]
-            sma_long = df_t['close'].rolling(self.long).mean().iloc[-1]
-            signals.append(1 if sma_short > sma_long else -1)
-        return np.array(signals)
-# ---------------------------
-# 5️⃣ Gym Environment for VN30 Reinforcement Learning
-# ---------------------------
-import numpy as np
-import pandas as pd
+    st.pyplot(fig)
+
+
+# ===============================
+# 3️⃣ Tối ưu Markowitz
+# ===============================
+
+def calculate_annualized_returns(df: pd.DataFrame, annualize: bool = True):
+    """Tính toán lợi suất trung bình năm."""
+    df["log_return"] = np.log(df["close"] / df["close"].shift(1))
+    mean_return = df.groupby("id")["log_return"].mean().dropna()
+    if annualize:
+        mean_return *= 252
+    return mean_return
+
+def calculate_cov_matrix(df: pd.DataFrame, annualize: bool = True):
+    """Tính ma trận hiệp phương sai."""
+    pivot = df.pivot(index="date", columns="id", values="close").dropna(how="all", axis=1)
+    returns = np.log(pivot / pivot.shift(1)).dropna(how="all", axis=0)
+    cov_matrix = returns.cov().fillna(0.0)
+    if annualize:
+        cov_matrix *= 252
+    return cov_matrix
+
+def optimize_markowitz(mean_returns, cov_matrix, top_n=10, method='sharpe', lambda_l2=0.01, max_weight=0.3):
+    """Tối ưu danh mục Markowitz."""
+    ids = list(mean_returns.index)
+    mean_returns = mean_returns.values
+    cov_matrix = cov_matrix.values
+    num_assets = len(ids)
+
+    def objective(weights):
+        weights = np.clip(weights, 0, 1)
+        port_return = np.dot(weights, mean_returns)
+        port_vol = np.sqrt(weights.T @ cov_matrix @ weights)
+        if method == "variance":
+            return port_vol + lambda_l2 * np.sum(weights ** 2)
+        else:
+            sharpe = -port_return / (port_vol + 1e-8)
+            return sharpe + lambda_l2 * np.sum(weights ** 2)
+
+    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1}]
+    bounds = tuple((0, max_weight) for _ in range(num_assets))
+    x0 = np.ones(num_assets) / num_assets
+
+    res = minimize(objective, x0=x0, bounds=bounds, constraints=constraints, method="SLSQP")
+    weights = np.clip(res.x, 0, 1)
+    weights /= np.sum(weights)
+    sorted_idx = np.argsort(-weights)[:top_n]
+    selected_ids = [ids[i] for i in sorted_idx]
+    selected_weights = weights[sorted_idx]
+    return selected_ids, selected_weights, weights
+
+
+def plot_efficient_frontier(mean_returns, cov_matrix, num_portfolios=3000):
+    """Vẽ đường Efficient Frontier."""
+    np.random.seed(42)
+    port_returns, port_vols = [], []
+    for _ in range(num_portfolios):
+        w = np.random.random(len(mean_returns))
+        w /= np.sum(w)
+        port_returns.append(np.dot(w, mean_returns))
+        port_vols.append(np.sqrt(w.T @ cov_matrix @ w))
+    port_returns, port_vols = np.array(port_returns), np.array(port_vols)
+    plt.figure(figsize=(8, 5))
+    plt.scatter(port_vols, port_returns, s=8, alpha=0.4)
+    plt.xlabel("Volatility")
+    plt.ylabel("Return")
+    plt.title("Efficient Frontier")
+    st.pyplot(plt)
+
+
+# ===============================
+# 4️⃣ Môi trường VN30TradingEnv
+# ===============================
+
 import gymnasium as gym
 from gymnasium import spaces
-from typing import List, Dict, Optional, Tuple
-from scipy.optimize import minimize
-class VN30TradingEnv(gym.Env):
-    metadata = {"render_modes": ["human"], "render_fps": 1}
 
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        tickers: List[str],
-        strategy_dict: Dict[str, object],
-        window_size: int = 10,
-        initial_cash: float = 100_000_000.0,
-        transaction_cost: float = 0.001,
-        max_leverage: float = 1.2,
-        risk_penalty: float = 0.1,
-        stability_reward: float = 0.1,
-        use_markowitz: bool = True
-    ):
+class VN30TradingEnv(gym.Env):
+    """
+    Môi trường Giao dịch VN30 mô phỏng quá trình tối ưu danh mục bằng PPO hoặc Markowitz.
+    """
+
+    metadata = {"render.modes": ["human"]}
+
+    def __init__(self, df: pd.DataFrame, tickers: List[str], window_size: int = 30, transaction_cost: float = 0.001):
         super().__init__()
-        self.df = df.copy().reset_index(drop=True)
-        self.df["date"] = pd.to_datetime(self.df["date"])
+        self.df = df
         self.tickers = tickers
         self.num_assets = len(tickers)
-        self.feature_cols = [col for col in df.columns if col not in ["date", "id", "sector", "source"]]
-        self.num_features = len(self.feature_cols)
         self.window_size = window_size
-        self.initial_cash = initial_cash
         self.transaction_cost = transaction_cost
-        self.max_leverage = max_leverage
-        self.risk_penalty = risk_penalty
-        self.stability_reward = stability_reward
-        self.use_markowitz = use_markowitz
-
-        self.asset_data = {ticker: df[df["id"] == ticker].reset_index(drop=True) for ticker in tickers}
-        self.dates = sorted(df["date"].unique())
-        self.max_steps = min(len(data) for data in self.asset_data.values()) -1
-        if self.max_steps < window_size + 1:
-            raise ValueError("Not enough data for the given window size.")
-
-        self.strategy_dict = strategy_dict
-        self.strategy_names = list(strategy_dict.keys())
-        self.num_strategies = len(strategy_dict)
 
         self.action_space = spaces.Box(low=0.0, high=1.0, shape=(self.num_assets,), dtype=np.float32)
-        obs_dim = (self.window_size * self.num_assets * self.num_features + self.num_assets * self.num_strategies + self.num_assets)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_assets, window_size, 6), dtype=np.float32)
 
-        self._init_state()
+        self.reset(seed=42)
 
-    def _init_state(self):
-        self.current_step = self.window_size
-        self.cash = self.initial_cash
-        self.asset_balance = np.zeros(self.num_assets, dtype=np.float32)
-        self.portfolio_value = self.initial_cash
-        self.navs = [self.initial_cash]
-        self.strategy_history = []
-        self.history = []
-        self.weights = np.zeros(self.num_assets, dtype=np.float32)
-        self.markowitz_weights = np.ones(self.num_assets) / self.num_assets
-
-        self.trades_log = []
-        self.last_nav = self.initial_cash
-        self.total_orders = 0
-        self.total_fees = 0.0
-        self.max_gross_exposure = 0.0
-        self.max_drawdown_duration = 0
-        self.position_coverage_log = []
-
-    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, dict]:
+    def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self._init_state()
-        obs = self._get_observation()
-        info = {"portfolio_value": self.portfolio_value, "current_date": self.dates[self.current_step - 1]}
-        return obs, info
+        self.current_step = self.window_size
+        self.cash = 1_000_000_000.0
+        self.asset_balance = np.zeros(self.num_assets)
+        self.portfolio_value = self.cash
+        self.navs = [self.cash]
+        self.total_fees = 0.0
+        self.dates = sorted(self.df["date"].unique())
+        self.asset_data = {t: self.df[self.df["id"] == t].reset_index(drop=True) for t in self.tickers}
+        return self._get_observation(), {}
 
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, dict]:
-        weights = np.asarray(action).flatten()
-        weights = weights / (np.sum(np.abs(weights)) + 1e-8)
+    def _get_observation(self):
+        obs = []
+        for t in self.tickers:
+            data = self.asset_data[t]
+            slice_data = data.iloc[max(0, self.current_step - self.window_size):self.current_step]
+            obs.append(slice_data[["close", "RSI", "ATR", "MACD", "MACD_signal", "Vol_Osc"]].values)
+        obs = np.array(obs)
+        if obs.shape[1] < self.window_size:
+            pad = np.zeros((self.num_assets, self.window_size - obs.shape[1], 6))
+            obs = np.concatenate([pad, obs], axis=1)
+        return obs
 
-        terminated = self.current_step >= self.max_steps
-
-        prev_nav = self.get_portfolio_value()
-
-        if self.use_markowitz:
-            self._apply_markowitz(weights)
-        else:
-            self.weights = weights
+    def step(self, action):
+        action = np.clip(action, 0, 1)
+        weights = action / (np.sum(action) + 1e-8)
 
         prices = self._get_prices(self.current_step)
-        self._update_portfolio(self.weights, prices)
+        prev_value = self.get_portfolio_value()
+        self._update_portfolio(weights, prices)
 
-        new_nav = self.get_portfolio_value()
-        self.navs.append(new_nav)
+        current_value = self.get_portfolio_value()
+        reward = (current_value - prev_value) / prev_value
 
-        nav_change = (new_nav - prev_nav) / (prev_nav + 1e-8)
-        returns = np.diff(self.navs) / self.navs[:-1]
-
-        rolling_sharpe = np.mean(returns[-30:]) / (np.std(returns[-30:]) + 1e-8) if len(returns) >= 30 else 0.0
-        neg_returns = [r for r in returns[-30:] if r < 0]
-        downside_std = np.std(neg_returns) if neg_returns else 1e-6
-        rolling_sortino = np.mean(returns[-30:]) / downside_std if downside_std > 0 else 0.0
-
-        benchmark_change = 0.0
-        if self.strategy_names:
-            base_strategy = self.strategy_dict[self.strategy_names[0]]
-            if self.current_step < self.max_steps:
-                benchmark_signals = base_strategy.generate_signal(self.df, self.current_step, self.tickers)
-                benchmark_weights = benchmark_signals / (np.sum(np.abs(benchmark_signals)) + 1e-8)
-                prev_prices = self._get_prices(self.current_step - 1)
-                benchmark_return = np.sum(benchmark_weights * (prices - prev_prices) / (prev_prices + 1e-8))
-                benchmark_change = benchmark_return
-
-        excess_return = nav_change - benchmark_change
-        vol_penalty = np.std(returns[-10:]) if len(returns) >= 10 else 0.0
-        drawdown = abs(self.get_max_drawdown())
-        stability_bonus = 1.0 if nav_change > 0 else 0.0
-
-        reward = (
-            0.6 * nav_change
-            - 0.3 * vol_penalty
-            + 0.5 * rolling_sharpe
-            + 0.3 * rolling_sortino
-            - 0.2 * drawdown
-            + 0.05 * stability_bonus
-            + 0.2 * excess_return
-        )
-
-        self.history.append(nav_change)
+        self.navs.append(current_value)
         self.current_step += 1
-
-        self.total_orders += np.count_nonzero(self.weights)
-        self.total_fees += np.sum(np.abs(self.weights)) * self.transaction_cost
-        self.trades_log.append({"step": self.current_step, "nav": new_nav, "reward": reward})
-        self.position_coverage_log.append(np.count_nonzero(self.weights) / self.num_assets)
-        self.max_gross_exposure = max(self.max_gross_exposure, np.sum(np.abs(self.weights)))
-
-        obs = self._get_observation()
-
-        info = {
-            "portfolio_value": new_nav,
-            "reward": reward,
-            "sharpe": self.get_sharpe_ratio(),
-            "max_drawdown": self.get_max_drawdown(),
-            "current_date": self.dates[min(self.current_step - 1, len(self.dates) - 1)]
-
-        }
-
-        return obs, reward, terminated, False, info
-
-
-    def _get_observation(self) -> np.ndarray:
-        obs_list = []
-        for ticker in self.tickers:
-            data = self.asset_data[ticker]
-            start_idx = max(0, self.current_step - self.window_size)
-            end_idx = self.current_step
-            obs = data.iloc[start_idx:end_idx][self.feature_cols].values
-            if len(obs) < self.window_size:
-                padding = np.zeros((self.window_size - len(obs), self.num_features))
-                obs = np.concatenate([padding, obs], axis=0)
-
-            obs_list.append(obs)
-        tech_obs = np.concatenate(obs_list, axis=0).flatten()
-
-        strat_signals = []
-        for name in self.strategy_names:
-            if self.current_step > self.window_size:
-                 signals = self.strategy_dict[name].generate_signal(self.df, self.current_step -1, self.tickers) # Pass current step -1
-            else:
-                 signals = np.zeros(self.num_assets)
-            strat_signals.append(signals)
-        strat_obs = np.concatenate(strat_signals, axis=0)
-
-        return np.concatenate([tech_obs, strat_obs, self.markowitz_weights]).astype(np.float32)
+        terminated = self.current_step >= len(self.dates) - 1
+        info = {"portfolio_value": current_value, "sharpe": self.get_sharpe_ratio()}
+        return self._get_observation(), float(reward), terminated, False, info
 
     def _get_prices(self, idx: int) -> np.ndarray:
-        """
-        Trả về giá close tại thời điểm idx cho tất cả mã cổ phiếu trong danh sách tickers.
-        """
         prices = []
         for ticker in self.tickers:
             data = self.asset_data[ticker]
@@ -520,76 +275,30 @@ class VN30TradingEnv(gym.Env):
         return np.array(prices, dtype=np.float32)
 
     def _update_portfolio(self, weights: np.ndarray, prices: np.ndarray):
-        """
-        Cập nhật giá trị danh mục dựa trên trọng số phân bổ và giá cổ phiếu mới.
-        """
         total_value = self.cash + np.sum(self.asset_balance * prices)
         target_value = total_value * weights
         current_value = self.asset_balance * prices
         trade_value = target_value - current_value
 
-        # Phí giao dịch
         fees = np.sum(np.abs(trade_value)) * self.transaction_cost
         self.total_fees += fees
         self.cash -= fees
-
-        # Cập nhật số lượng cổ phiếu
-        self.asset_balance = target_value / prices
+        self.asset_balance = target_value / (prices + 1e-8)
         self.cash = total_value - np.sum(self.asset_balance * prices) - fees
         self.portfolio_value = self.cash + np.sum(self.asset_balance * prices)
 
-    def _apply_markowitz(self, weights: np.ndarray):
-        """
-        Tính toán trọng số Markowitz dựa trên returns trong quá khứ.
-        """
-        try:
-            window_start = max(0, self.current_step - self.window_size)
-            df_window = self.df[self.df["date"].between(self.dates[window_start], self.dates[self.current_step])]
-            df_window = df_window[df_window["id"].isin(self.tickers)]
-
-            mean_returns = calculate_annualized_returns(df_window, annualize=False)
-            cov_matrix = calculate_cov_matrix(df_window, annualize=False)
-
-            selected_ids, selected_weights = optimize_markowitz(
-                mean_returns, cov_matrix, top_n=self.num_assets,
-                method='sharpe', lambda_l2=0.01, max_weight=0.3
-            )
-
-            self.markowitz_weights = np.zeros(self.num_assets)
-            for i, t in enumerate(self.tickers):
-                if t in selected_ids:
-                    self.markowitz_weights[i] = selected_weights[selected_ids.index(t)]
-            self.weights = self.markowitz_weights / (np.sum(self.markowitz_weights) + 1e-8)
-        except Exception as e:
-            logging.warning(f"Lỗi tính Markowitz: {e}")
-            self.weights = weights
-
     def get_portfolio_value(self) -> float:
-        """
-        Tính tổng giá trị danh mục hiện tại (NAV).
-        """
-        if self.current_step >= len(self.dates):
-            idx = len(self.dates) - 1
-        else:
-            idx = self.current_step
+        idx = min(self.current_step, len(self.dates) - 1)
         prices = self._get_prices(idx)
         return self.cash + np.sum(self.asset_balance * prices)
 
     def get_sharpe_ratio(self) -> float:
-        """
-        Tính Sharpe Ratio dựa trên chuỗi NAV.
-        """
         if len(self.navs) < 2:
             return 0.0
         returns = np.diff(self.navs) / np.array(self.navs[:-1])
-        mean_ret = np.mean(returns)
-        std_ret = np.std(returns) + 1e-8
-        return mean_ret / std_ret if std_ret > 0 else 0.0
+        return np.mean(returns) / (np.std(returns) + 1e-8)
 
     def get_max_drawdown(self) -> float:
-        """
-        Tính mức sụt giảm tối đa (Max Drawdown) của danh mục.
-        """
         if not self.navs:
             return 0.0
         nav_series = np.array(self.navs)
@@ -598,200 +307,281 @@ class VN30TradingEnv(gym.Env):
         return np.min(drawdown)
 
     def render(self, mode="human"):
-        """
-        Hiển thị biểu đồ NAV, Sharpe, và Drawdown.
-        """
-        df_nav = pd.DataFrame({
-            "Date": self.dates[self.window_size:self.window_size + len(self.navs)],
-            "NAV": self.navs
-        })
+        df_nav = pd.DataFrame({"Date": self.dates[self.window_size:self.window_size + len(self.navs)],
+                               "NAV": self.navs})
         sharpe = self.get_sharpe_ratio()
         mdd = self.get_max_drawdown()
-
         fig, ax = plt.subplots(figsize=(10, 5))
         ax.plot(df_nav["Date"], df_nav["NAV"], label="NAV", color="blue")
         ax.set_title(f"Portfolio NAV | Sharpe: {sharpe:.2f} | Max Drawdown: {mdd:.2%}")
         ax.set_xlabel("Date")
         ax.set_ylabel("Portfolio Value (VND)")
-        ax.grid(True)
         ax.legend()
+        ax.grid(True)
         plt.tight_layout()
         st.pyplot(fig)
+
+# This combined file contains two standalone scripts for your project:
+# 1) train_ppo_vn30.py  - training script to train PPO on VN30TradingEnv
+# 2) evaluate_model.py  - evaluation script to load a trained PPO model and produce metrics/plots
+#
+# Save each section into its own file if you prefer (separate by the '### FILE:' markers).
+
+"""
+### FILE: train_ppo_vn30.py
+Train PPO on VN30TradingEnv (uses helpers_vn30.py)
+Usage example:
+    python train_ppo_vn30.py --csv vn30_30stocks.csv --save_dir ./checkpoints --timesteps 50000 --log_interval 10
+"""
+
 import os
+import argparse
+import logging
+from typing import Callable
+
 import numpy as np
 import pandas as pd
-import gymnasium as gym
-from gymnasium import spaces, Wrapper
-from typing import List, Dict, Optional, Tuple
-from scipy.optimize import minimize
-import torch
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, VecNormalize
-from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback, CallbackList
-from stable_baselines3.common.monitor import Monitor
-# === Risk Management Wrapper ===
-class RiskManagementWrapper(Wrapper):
-    def __init__(self, env, reward_scaling: float = 1.0, max_drawdown_threshold: float = -0.25):
-        super().__init__(env)
-        self.reward_scaling = reward_scaling
-        self.max_drawdown_threshold = max_drawdown_threshold
 
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        reward *= self.reward_scaling
-        if info.get("max_drawdown", 0) < self.max_drawdown_threshold:
-            terminated = True
-            info["early_stop"] = "drawdown_limit_exceeded"
-        return obs, reward, terminated, truncated, info
-# === TensorBoard Entropy Logging ===
+# local helpers (make sure helpers_vn30.py is on PYTHONPATH or same folder)
+import helpers_vn30 as helpers
+
+# stable-baselines3 imports guarded
+try:
+    import torch
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, VecNormalize
+    from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, CallbackList, BaseCallback
+    from stable_baselines3.common.monitor import Monitor
+    STABLE_AVAILABLE = True
+except Exception as e:
+    STABLE_AVAILABLE = False
+
+
 class TensorboardEntropyCallback(BaseCallback):
+    """Callback to log entropy coefficient to tensorboard (if available)."""
     def __init__(self, verbose=0):
         super().__init__(verbose)
 
     def _on_step(self) -> bool:
         if self.logger:
-            entropy = self.model.ent_coef
-            if isinstance(entropy, torch.Tensor):
-                entropy = entropy.item()
-            self.logger.record("train/entropy", entropy)
+            ent = getattr(self.model, 'ent_coef', None)
+            if hasattr(ent, 'item'):
+                try:
+                    ent_val = ent.item()
+                except Exception:
+                    ent_val = float(ent)
+            else:
+                ent_val = float(ent) if ent is not None else None
+            if ent_val is not None:
+                self.logger.record('train/entropy_coef', ent_val)
         return True
-# === Create Vec Environment ===
-def create_vec_env(env_fn):
-    vec_env = DummyVecEnv([env_fn])
-    vec_env = VecNormalize(VecMonitor(vec_env), norm_obs=True, norm_reward=False, clip_obs=10.0)
-    return vec_env
-# === Train PPO Agent ===
-def train_ppo_agent(env_fn, eval_env_fn, save_dir="./checkpoints", total_timesteps=10_000):
+
+
+def create_vec_env(env_fn: Callable):
+    """Create normalized vectorized environment for training and evaluation."""
+    v = DummyVecEnv([env_fn])
+    v = VecMonitor(v)
+    v = VecNormalize(v, norm_obs=True, norm_reward=False, clip_obs=10.0)
+    return v
+
+
+def make_env_factory(df: pd.DataFrame, tickers: list, window_size: int = 10, transaction_cost: float = 0.001):
+    def _init():
+        env = helpers.VN30TradingEnv(df=df, tickers=tickers, window_size=window_size, transaction_cost=transaction_cost)
+        env = Monitor(env)
+        return env
+    return _init
+
+
+def train(csv_path: str, save_dir: str = './checkpoints', total_timesteps: int = 50000, window_size: int = 10):
+    if not STABLE_AVAILABLE:
+        raise RuntimeError('stable-baselines3 or torch not available. Install with: pip install stable-baselines3 torch')
+
     os.makedirs(save_dir, exist_ok=True)
+    df_raw = pd.read_csv(csv_path)
+    # normalize columns
+    df_raw.columns = df_raw.columns.str.lower()
+    required = {'date', 'id', 'open', 'high', 'low', 'close', 'volume'}
+    if not required.issubset(set(df_raw.columns)):
+        raise KeyError(f'CSV must contain columns: {sorted(required)}')
+
+    # compute indicators per stock
+    df_with_indicators = helpers.add_indicators_per_stock(df_raw)
+    # choose tickers
+    tickers = sorted([t for t in df_with_indicators['id'].unique()])
+
+    # prepare env factories
+    env_fn = make_env_factory(df_with_indicators, tickers, window_size=window_size)
+    eval_env_fn = make_env_factory(df_with_indicators, tickers, window_size=window_size)
 
     vec_env = create_vec_env(env_fn)
-    vec_eval_env = create_vec_env(eval_env_fn)
-    vec_eval_env.training = False
+    vec_eval = create_vec_env(eval_env_fn)
+    vec_eval.training = False
 
-    checkpoint_callback = CheckpointCallback(
-        save_freq=10_000,
-        save_path=save_dir,
-        name_prefix="ppo_vn30"
-    )
+    # callbacks
+    checkpoint_cb = CheckpointCallback(save_freq=max(1, total_timesteps // 5), save_path=save_dir, name_prefix='ppo_vn30')
+    eval_cb = EvalCallback(vec_eval, best_model_save_path=save_dir, log_path=save_dir, eval_freq=max(1, total_timesteps // 10), deterministic=True, render=False)
+    ent_cb = TensorboardEntropyCallback()
+    cb_list = CallbackList([checkpoint_cb, eval_cb, ent_cb])
 
-    eval_callback = EvalCallback(
-        vec_eval_env,
-        best_model_save_path=save_dir,
-        log_path=save_dir,
-        eval_freq=10_000,
-        deterministic=True,
-        render=False
-    )
+    # PPO hyperparameters: conservative defaults that work on CPU
+    model = PPO('MlpPolicy', vec_env, verbose=1,
+                tensorboard_log=os.path.join(save_dir, 'tensorboard'),
+                n_steps=2048, batch_size=64, n_epochs=10,
+                learning_rate=3e-4, gae_lambda=0.95, gamma=0.99, ent_coef=0.005,
+                max_grad_norm=0.5, clip_range=0.2)
 
-    entropy_callback = TensorboardEntropyCallback()
-    callback = CallbackList([checkpoint_callback, eval_callback, entropy_callback])
+    try:
+        model.learn(total_timesteps=int(total_timesteps), callback=cb_list)
+        model_path = os.path.join(save_dir, 'ppo_vn30.zip')
+        model.save(model_path)
+        print(f'Training finished. Model saved to: {model_path}')
+        return model_path
+    except Exception as e:
+        model.save(os.path.join(save_dir, 'ppo_vn30_failed.zip'))
+        raise
 
-    model = PPO(
-        "MlpPolicy",
-        vec_env,
-        verbose=1,
-        tensorboard_log=os.path.join(save_dir, "tensorboard"),
-        n_steps=2048,
-        batch_size=64,
-        gae_lambda=0.95,
-        gamma=0.99,
-        ent_coef=0.005,
-        learning_rate=3e-4,
-        clip_range=0.2,
-        n_epochs=10,
-        max_grad_norm=0.5
-    )
 
-    model.learn(total_timesteps=total_timesteps, callback=callback)
-    model.save(os.path.join(save_dir, "ppo_final_model"))
-    print("Training complete. Final model saved.")
-    return model
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Train PPO on VN30TradingEnv')
+    parser.add_argument('--csv', type=str, required=True, help='Path to CSV containing stock data')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints', help='Directory to save models and logs')
+    parser.add_argument('--timesteps', type=int, default=50000, help='Total timesteps for PPO.learn')
+    parser.add_argument('--window', type=int, default=10, help='Window size for env')
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO)
+    train(args.csv, save_dir=args.save_dir, total_timesteps=args.timesteps, window_size=args.window)
+
+
+# ------------------------------------------------------------------------------
+#
+# ### FILE: evaluate_model.py
+# Load trained PPO model, run evaluation episodes, compute metrics and plots
+# Usage example:
+#    python evaluate_model.py --model ./checkpoints/ppo_vn30.zip --csv vn30_30stocks.csv --episodes 1 --window 10 --out_dir ./eval
+#
+# ------------------------------------------------------------------------------
+
+import os
+import argparse
+import json
+import math
 import numpy as np
 import pandas as pd
-import itertools
-import torch
 import matplotlib.pyplot as plt
 
-def evaluate_performance(env, model=None) -> pd.DataFrame:
-    navs = np.array(env.navs)
-    trades = pd.DataFrame(env.trades_log)
+try:
+    import torch
+    from stable_baselines3 import PPO
+    STABLE_AVAILABLE = True
+except Exception:
+    STABLE_AVAILABLE = False
 
-    total_return = (navs[-1] - navs[0]) / navs[0]
+import helpers_vn30 as helpers
 
+
+def run_episode(env, model, render=False, deterministic=True, max_steps=None):
+    obs, info = env.reset()
+    done = False
+    navs = [env.get_portfolio_value()]
+    rewards = []
+    actions = []
+    steps = 0
+    while not done:
+        action, _ = model.predict(obs, deterministic=deterministic)
+        obs, reward, done, truncated, info = env.step(action)
+        navs.append(env.get_portfolio_value())
+        rewards.append(reward)
+        actions.append(action)
+        steps += 1
+        if max_steps is not None and steps >= max_steps:
+            break
+    return np.array(navs), np.array(rewards), np.array(actions), info
+
+
+def compute_metrics_from_navs(navs: np.ndarray):
+    # basic metrics: total return, CAGR, volatility, sharpe, max drawdown, sortino
+    total_return = navs[-1] / navs[0] - 1.0
+    days = len(navs)
+    years = max(days / 252.0, 1.0 / 252.0)
+    cagr = (navs[-1] / navs[0]) ** (1.0 / years) - 1.0
+    returns = np.diff(navs) / (navs[:-1] + 1e-10)
+    ann_vol = np.std(returns) * math.sqrt(252) if len(returns) > 1 else 0.0
+    sharpe = (np.mean(returns) / (np.std(returns) + 1e-10)) * math.sqrt(252) if len(returns) > 1 else 0.0
+    neg = returns[returns < 0]
+    downside = np.std(neg) * math.sqrt(252) if len(neg) > 0 else 1e-10
+    sortino = (np.mean(returns) / downside) if downside > 0 else np.nan
+    # drawdown
     running_max = np.maximum.accumulate(navs)
-    drawdowns = navs - running_max
-    max_dd = np.min(drawdowns) / (running_max.max() + 1e-8)
-    dd_duration = max((len(list(g)) for k, g in itertools.groupby(drawdowns < 0) if k), default=0)
-
-    trade_returns = trades["nav"].pct_change().dropna() if "nav" in trades else pd.Series()
-    winning_trades = trade_returns[trade_returns > 0]
-    losing_trades = trade_returns[trade_returns < 0]
-
-    sharpe = (trade_returns.mean() / (trade_returns.std() + 1e-8)) * np.sqrt(252) if not trade_returns.empty else np.nan
-    sortino = (trade_returns.mean() / (trade_returns[trade_returns < 0].std() + 1e-8)) * np.sqrt(252) if not trade_returns.empty else np.nan
-    profit_factor = winning_trades.sum() / abs(losing_trades.sum() + 1e-8) if not trade_returns.empty else "N/A"
-    expectancy = trade_returns.mean() if not trade_returns.empty else np.nan
-
-    entropy_value = getattr(model, "ent_coef", None)
-    if isinstance(entropy_value, torch.Tensor):
-        entropy_value = entropy_value.item()
-    entropy_display = round(entropy_value, 6) if entropy_value is not None else "Không có ent_coef"
-    summary = {
-        "Start NAV": f"{navs[0]:,.0f}",
-        "End NAV": f"{navs[-1]:,.0f}",
-        "Total Return": f"{total_return:.2%}",
-        "Max Drawdown": f"{max_dd:.2%}",
-        "Max Drawdown Duration": dd_duration,
-        "Total Orders": getattr(env, "total_orders", "N/A"),
-        "Total Trades": len(trade_returns),
-        "Total Fees Paid": f"{getattr(env, 'total_fees', 0):,.0f} đ",
-        "Win Rate": f"{(len(winning_trades) / len(trade_returns)):.2%}" if len(trade_returns) > 0 else "N/A",
-        "Best Trade": f"{trade_returns.max():.2%}" if not trade_returns.empty else "N/A",
-        "Worst Trade": f"{trade_returns.min():.2%}" if not trade_returns.empty else "N/A",
-        "Avg Winning Trade": f"{winning_trades.mean():.2%}" if not winning_trades.empty else "N/A",
-        "Avg Losing Trade": f"{losing_trades.mean():.2%}" if not losing_trades.empty else "N/A",
-        "Profit Factor": round(profit_factor, 3) if not isinstance(profit_factor, str) else profit_factor,
-        "Expectancy": round(expectancy, 5) if not np.isnan(expectancy) else "N/A",
-        "Sharpe Ratio": round(sharpe, 3) if not np.isnan(sharpe) else "N/A",
-        "Sortino Ratio": round(sortino, 3) if not np.isnan(sortino) else "N/A",
-        "Max Gross Exposure": round(getattr(env, 'max_gross_exposure', 0), 3),
-        "Total Steps": len(trades),
-        "Mean Episode Reward": round(trades["reward"].mean(), 6) if "reward" in trades and not trades["reward"].empty else "N/A",
-        "Entropy": entropy_display
+    drawdowns = (navs - running_max) / (running_max + 1e-10)
+    max_dd = np.min(drawdowns)
+    return {
+        'total_return': total_return,
+        'cagr': cagr,
+        'ann_vol': ann_vol,
+        'sharpe': sharpe,
+        'sortino': sortino,
+        'max_drawdown': max_dd
     }
-    return pd.DataFrame([summary]).T.rename(columns={0: "Value"})
-def plot_drawdown(env):
-    navs = np.array(env.navs)
-    peak = np.maximum.accumulate(navs)
-    drawdown = (navs - peak) / (peak + 1e-8)
-    dates = env.dates[env.window_size:env.window_size + len(drawdown)]
 
-    plt.figure(figsize=(12, 4))
-    plt.plot(dates, drawdown, color='red')
-    plt.title("Maximum Drawdown Over Time")
-    plt.xlabel("Date")
-    plt.ylabel("Drawdown (%)")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
-def plot_rolling_sharpe(env, window: int = 20):
-    navs = np.array(env.navs[env.window_size:])
-    returns = pd.Series(np.diff(navs) / navs[:-1])
-    rolling_mean = returns.rolling(window).mean()
-    rolling_std = returns.rolling(window).std()
-    rolling_sharpe = (rolling_mean / (rolling_std + 1e-8)) * np.sqrt(252)
 
-    valid_dates = env.dates[env.window_size + window - 1:env.current_step]
-    min_len = min(len(valid_dates), len(rolling_sharpe))
-    valid_dates = valid_dates[:min_len]
-    rolling_sharpe = rolling_sharpe[:min_len]
+def evaluate_model(model_path: str, csv_path: str, out_dir: str = './eval', episodes: int = 1, window: int = 10):
+    if not STABLE_AVAILABLE:
+        raise RuntimeError('stable-baselines3 not available. Install to run evaluation with PPO model.')
 
-    plt.figure(figsize=(12, 4))
-    plt.plot(valid_dates, rolling_sharpe, label=f"{window}-step Rolling Sharpe")
-    plt.axhline(0, color='gray', linestyle='--', linewidth=1)
-    plt.title("Rolling Sharpe Ratio")
-    plt.xlabel("Date")
-    plt.ylabel("Sharpe Ratio")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
+    os.makedirs(out_dir, exist_ok=True)
+    df_raw = pd.read_csv(csv_path)
+    df_raw.columns = df_raw.columns.str.lower()
+    df_with_indicators = helpers.add_indicators_per_stock(df_raw)
+    tickers = sorted(list(df_with_indicators['id'].unique()))
+
+    # load model
+    model = PPO.load(model_path)
+
+    # create env
+    def env_fn():
+        env = helpers.VN30TradingEnv(df_with_indicators, tickers, window_size=window)
+        return env
+
+    env = env_fn()
+
+    results = []
+    for ep in range(episodes):
+        navs, rewards, actions, info = run_episode(env, model, deterministic=True)
+        metrics = compute_metrics_from_navs(navs)
+        metrics['episode'] = ep + 1
+        metrics['steps'] = len(navs) - 1
+        results.append(metrics)
+
+        # save navs and rewards
+        np.savetxt(os.path.join(out_dir, f'navs_ep{ep+1}.csv'), navs, delimiter=',')
+        np.savetxt(os.path.join(out_dir, f'rewards_ep{ep+1}.csv'), rewards, delimiter=',')
+
+        # plot NAV
+        plt.figure(figsize=(10,5))
+        plt.plot(navs)
+        plt.title(f'NAV — Episode {ep+1} | Return: {metrics["total_return"]:.2%} | Sharpe: {metrics["sharpe"]:.2f}')
+        plt.xlabel('Step'); plt.ylabel('NAV')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, f'nav_ep{ep+1}.png'))
+        plt.close()
+
+    df_res = pd.DataFrame(results)
+    df_res.to_csv(os.path.join(out_dir, 'evaluation_summary.csv'), index=False)
+    print('Evaluation complete. Results saved to', out_dir)
+    return df_res
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Evaluate PPO model on VN30TradingEnv')
+    parser.add_argument('--model', type=str, required=True, help='Path to trained PPO model (.zip)')
+    parser.add_argument('--csv', type=str, required=True, help='CSV with historical data')
+    parser.add_argument('--episodes', type=int, default=1)
+    parser.add_argument('--window', type=int, default=10)
+    parser.add_argument('--out_dir', type=str, default='./eval')
+    args = parser.parse_args()
+
+    evaluate_model(args.model, args.csv, out_dir=args.out_dir, episodes=args.episodes, window=args.window)
+
