@@ -507,103 +507,116 @@ class VN30TradingEnv(gym.Env):
         return np.concatenate([tech_obs, strat_obs, self.markowitz_weights]).astype(np.float32)
 
     def _get_prices(self, idx: int) -> np.ndarray:
-        if idx >= len(self.dates):
-             idx = len(self.dates) - 1
-        date = self.dates[idx]
+        """
+        Trả về giá close tại thời điểm idx cho tất cả mã cổ phiếu trong danh sách tickers.
+        """
         prices = []
         for ticker in self.tickers:
-            price_data = self.asset_data[ticker][self.asset_data[ticker]['date'] == date]['close']
-            if not price_data.empty:
-                prices.append(price_data.iloc[0])
+            data = self.asset_data[ticker]
+            if idx >= len(data):
+                prices.append(data["close"].iloc[-1])
             else:
-                last_known_price = self.asset_data[ticker].iloc[min(idx, len(self.asset_data[ticker]) - 1)]['close']
-                prices.append(last_known_price)
+                prices.append(data["close"].iloc[idx])
         return np.array(prices, dtype=np.float32)
 
     def _update_portfolio(self, weights: np.ndarray, prices: np.ndarray):
-        alloc = weights / (np.sum(np.abs(weights)) + 1e-8)
-        total_value = self.get_portfolio_value()
-        target_values = alloc * total_value
-        current_values = self.asset_balance * prices
-        delta_values = target_values - current_values
-        trade_shares = delta_values / (prices + 1e-8)
-        transaction_costs = np.sum(np.abs(trade_shares * prices)) * self.transaction_cost
+        """
+        Cập nhật giá trị danh mục dựa trên trọng số phân bổ và giá cổ phiếu mới.
+        """
+        total_value = self.cash + np.sum(self.asset_balance * prices)
+        target_value = total_value * weights
+        current_value = self.asset_balance * prices
+        trade_value = target_value - current_value
 
-        total_trade_cost = np.sum(trade_shares * prices) + transaction_costs
-        if total_trade_cost > self.cash:
-            scale = self.cash / (total_trade_cost + 1e-8)
-            trade_shares *= scale
-            transaction_costs *= scale
+        # Phí giao dịch
+        fees = np.sum(np.abs(trade_value)) * self.transaction_cost
+        self.total_fees += fees
+        self.cash -= fees
 
-        self.asset_balance += trade_shares
-        self.cash -= np.sum(trade_shares * prices) + transaction_costs
+        # Cập nhật số lượng cổ phiếu
+        self.asset_balance = target_value / prices
+        self.cash = total_value - np.sum(self.asset_balance * prices) - fees
+        self.portfolio_value = self.cash + np.sum(self.asset_balance * prices)
+
+    def _apply_markowitz(self, weights: np.ndarray):
+        """
+        Tính toán trọng số Markowitz dựa trên returns trong quá khứ.
+        """
+        try:
+            window_start = max(0, self.current_step - self.window_size)
+            df_window = self.df[self.df["date"].between(self.dates[window_start], self.dates[self.current_step])]
+            df_window = df_window[df_window["id"].isin(self.tickers)]
+
+            mean_returns = calculate_annualized_returns(df_window, annualize=False)
+            cov_matrix = calculate_cov_matrix(df_window, annualize=False)
+
+            selected_ids, selected_weights = optimize_markowitz(
+                mean_returns, cov_matrix, top_n=self.num_assets,
+                method='sharpe', lambda_l2=0.01, max_weight=0.3
+            )
+
+            self.markowitz_weights = np.zeros(self.num_assets)
+            for i, t in enumerate(self.tickers):
+                if t in selected_ids:
+                    self.markowitz_weights[i] = selected_weights[selected_ids.index(t)]
+            self.weights = self.markowitz_weights / (np.sum(self.markowitz_weights) + 1e-8)
+        except Exception as e:
+            logging.warning(f"Lỗi tính Markowitz: {e}")
+            self.weights = weights
 
     def get_portfolio_value(self) -> float:
-        price_step = min(self.current_step - 1, len(self.dates) - 1)
-        if price_step < self.window_size -1:
-             return float(self.initial_cash)
-        prices = self._get_prices(price_step)
-        return float(self.cash + np.sum(self.asset_balance * prices))
-
-    def _apply_markowitz(self, raw_weights: np.ndarray):
-        raw_weights = raw_weights / (np.sum(raw_weights) + 1e-8)
-        returns_list, valid_assets = [], []
-        if self.current_step < self.window_size + 1:
-             self.markowitz_weights = np.ones(self.num_assets) / self.num_assets
-             self.weights = self.markowitz_weights
-             return
-
-        for idx, ticker in enumerate(self.tickers):
-            start_idx = max(0, self.current_step - self.window_size)
-            end_idx = self.current_step
-            prices = self.asset_data[ticker].iloc[start_idx:end_idx]["close"].values
-
-            if len(prices) >= self.window_size:
-                ret = np.diff(prices) / (prices[:-1] + 1e-8)
-                if not np.any(np.isnan(ret)) and not np.all(ret == 0):
-                    returns_list.append(ret)
-                    valid_assets.append(idx)
-
-        if len(valid_assets) < 2:
-            self.markowitz_weights = np.ones(self.num_assets) / self.num_assets
-            self.weights = self.markowitz_weights
-            return
-
-        R = np.stack(returns_list, axis=-1)
-        mu = np.mean(R, axis=0)
-        Sigma = np.cov(R, rowvar=False)
-
-        if not np.all(np.isfinite(Sigma)) or np.linalg.cond(Sigma) > 1e10:
-             Sigma = Sigma + np.identity(len(valid_assets)) * 1e-6
-        bounds = [(0, 1)] * len(valid_assets)
-        constraints = {"type": "eq", "fun": lambda w: np.sum(w) - 1}
-        init_guess = raw_weights[valid_assets]
-        result = minimize(lambda w: float(w @ Sigma @ w), init_guess, method="SLSQP", bounds=bounds, constraints=constraints)
-
-        markowitz_weights = result.x if result.success else init_guess
-        self.markowitz_weights = np.zeros(self.num_assets)
-        for i, idx in enumerate(valid_assets):
-            self.markowitz_weights[idx] = markowitz_weights[i]
-
-        self.weights = self.markowitz_weights / (np.sum(self.markowitz_weights) + 1e-8)
+        """
+        Tính tổng giá trị danh mục hiện tại (NAV).
+        """
+        if self.current_step >= len(self.dates):
+            idx = len(self.dates) - 1
+        else:
+            idx = self.current_step
+        prices = self._get_prices(idx)
+        return self.cash + np.sum(self.asset_balance * prices)
 
     def get_sharpe_ratio(self) -> float:
+        """
+        Tính Sharpe Ratio dựa trên chuỗi NAV.
+        """
         if len(self.navs) < 2:
             return 0.0
-        returns = np.diff(self.navs) / self.navs[:-1]
-        return np.mean(returns) / (np.std(returns) + 1e-8) * np.sqrt(252)
+        returns = np.diff(self.navs) / np.array(self.navs[:-1])
+        mean_ret = np.mean(returns)
+        std_ret = np.std(returns) + 1e-8
+        return mean_ret / std_ret if std_ret > 0 else 0.0
 
     def get_max_drawdown(self) -> float:
-        navs = np.array(self.navs)
-        peak = np.maximum.accumulate(navs)
-        drawdowns = (navs - peak) / (peak + 1e-8)
-        return np.min(drawdowns) if len(drawdowns) > 0 else 0.0
+        """
+        Tính mức sụt giảm tối đa (Max Drawdown) của danh mục.
+        """
+        if not self.navs:
+            return 0.0
+        nav_series = np.array(self.navs)
+        rolling_max = np.maximum.accumulate(nav_series)
+        drawdown = (nav_series - rolling_max) / (rolling_max + 1e-8)
+        return np.min(drawdown)
 
-    def render(self):
-        print(f"Step {self.current_step}/{self.max_steps} | NAV: {self.get_portfolio_value():,.2f}")
+    def render(self, mode="human"):
+        """
+        Hiển thị biểu đồ NAV, Sharpe, và Drawdown.
+        """
+        df_nav = pd.DataFrame({
+            "Date": self.dates[self.window_size:self.window_size + len(self.navs)],
+            "NAV": self.navs
+        })
+        sharpe = self.get_sharpe_ratio()
+        mdd = self.get_max_drawdown()
 
-    def close(self):
-        pass
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(df_nav["Date"], df_nav["NAV"], label="NAV", color="blue")
+        ax.set_title(f"Portfolio NAV | Sharpe: {sharpe:.2f} | Max Drawdown: {mdd:.2%}")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Portfolio Value (VND)")
+        ax.grid(True)
+        ax.legend()
+        plt.tight_layout()
+        st.pyplot(fig)
 import os
 import numpy as np
 import pandas as pd
